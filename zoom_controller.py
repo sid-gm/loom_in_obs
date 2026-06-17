@@ -66,6 +66,27 @@ except ImportError:
     log.error("pynput not installed. Run ./start.sh or: pip install pynput")
     sys.exit(1)
 
+# ── ACCESSIBILITY (text-caret detection) ──────────────────────────────────────
+# Optional: lets typing zoom to the actual caret instead of the element centre.
+# Falls back gracefully if unavailable.
+try:
+    from AppKit import NSWorkspace
+    from ApplicationServices import (
+        AXUIElementCreateApplication,
+        AXUIElementCopyAttributeValue,
+        AXUIElementCopyParameterizedAttributeValue,
+        AXValueGetValue,
+        kAXValueCGRectType,
+        kAXValueCGPointType,
+        kAXValueCGSizeType,
+        kAXFocusedUIElementAttribute,
+        kAXSelectedTextRangeAttribute,
+        kAXBoundsForRangeParameterizedAttribute,
+    )
+    _AX_AVAILABLE = True
+except Exception:
+    _AX_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Caret / focus position detection
@@ -132,11 +153,118 @@ def get_mouse_position() -> tuple[int, int]:
     return SCREEN_W // 2, SCREEN_H // 2
 
 
+def _frontmost_focused_element():
+    """
+    The AX focused UI element of the frontmost app, or None.
+
+    Goes through the *frontmost application* element — the system-wide focused
+    element is unreliable (returns kAXErrorCannotComplete here even when trusted).
+    """
+    if not _AX_AVAILABLE:
+        return None
+    try:
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is None:
+            return None
+        app_el = AXUIElementCreateApplication(front.processIdentifier())
+        err, focused = AXUIElementCopyAttributeValue(
+            app_el, kAXFocusedUIElementAttribute, None)
+        if err != 0 or focused is None:
+            return None
+        return focused
+    except Exception:
+        return None
+
+
+def _on_screen(cx: int, cy: int) -> bool:
+    return 0 <= cx <= SCREEN_W and 0 <= cy <= SCREEN_H
+
+
+def get_caret_position() -> tuple[int, int] | None:
+    """
+    Screen (x, y) of the text caret via the macOS Accessibility API — what you're
+    actually typing — or None if the focused app doesn't expose a real caret rect.
+
+    Chrome/Chromium/Electron apps don't implement AXBoundsForRange and hand back
+    a degenerate (0-height) rect like (0, screen_h, 0, 0); we reject those so the
+    caller falls back to the focused element's frame instead.
+    """
+    focused = _frontmost_focused_element()
+    if focused is None:
+        return None
+    try:
+        # Insertion point / selection range (length 0 = collapsed caret).
+        err, rng = AXUIElementCopyAttributeValue(
+            focused, kAXSelectedTextRangeAttribute, None)
+        if err != 0 or rng is None:
+            return None
+
+        # Screen rect of that range.
+        err, bounds = AXUIElementCopyParameterizedAttributeValue(
+            focused, kAXBoundsForRangeParameterizedAttribute, rng, None)
+        if err != 0 or bounds is None:
+            return None
+
+        ok, rect = AXValueGetValue(bounds, kAXValueCGRectType, None)
+        if not ok:
+            return None
+
+        # A real collapsed caret has zero width but a non-zero line height.
+        # Reject degenerate rects (Chrome's garbage) and off-screen results.
+        if rect.size.height < 1:
+            return None
+        cx = int(rect.origin.x + rect.size.width / 2.0)
+        cy = int(rect.origin.y + rect.size.height / 2.0)
+        return (cx, cy) if _on_screen(cx, cy) else None
+    except Exception:
+        return None
+
+
+def get_focused_element_frame() -> tuple[int, int] | None:
+    """
+    Centre of the focused text element's frame (AXPosition + AXSize) — i.e. the
+    field/region you're typing in. Works when caret bounds don't (e.g. Chrome),
+    so typing follows the text instead of falling back to the mouse position.
+    """
+    focused = _frontmost_focused_element()
+    if focused is None:
+        return None
+    try:
+        ep, posv = AXUIElementCopyAttributeValue(focused, "AXPosition", None)
+        es, sizev = AXUIElementCopyAttributeValue(focused, "AXSize", None)
+        if ep != 0 or es != 0 or posv is None or sizev is None:
+            return None
+        okp, pt = AXValueGetValue(posv, kAXValueCGPointType, None)
+        oks, sz = AXValueGetValue(sizev, kAXValueCGSizeType, None)
+        if not (okp and oks):
+            return None
+        cx = int(pt.x + sz.width / 2.0)
+        cy = int(pt.y + sz.height / 2.0)
+        return (cx, cy) if _on_screen(cx, cy) else None
+    except Exception:
+        return None
+
+
 def get_focus_region() -> tuple[int, int, int]:
     """
-    Returns (center_x, center_y, radius) in screen coordinates.
-    Tries AppleScript accessibility first, falls back to mouse position.
+    Returns (center_x, center_y, radius) in screen coordinates — the thing being
+    typed into. Priority:
+      1. text caret          (native apps — exact)
+      2. focused-element frame (Chrome/Electron — the field/region you're typing in)
+      3. AppleScript element  (legacy fallback)
+      4. mouse position       (last resort)
     """
+    # 1. Exact caret position (native apps).
+    caret = get_caret_position()
+    if caret is not None:
+        return caret[0], caret[1], 400
+
+    # 2. Focused element's frame — follows the text even when caret bounds aren't
+    #    available (e.g. Chrome), instead of jumping to the mouse cursor.
+    frame = get_focused_element_frame()
+    if frame is not None:
+        return frame[0], frame[1], 400
+
     raw = _run_applescript(APPLESCRIPT_FOCUSED_ELEMENT)
 
     if raw and raw != "error":
